@@ -113,9 +113,10 @@ class ResourceProcessor:
 
         Workflow:
         1. Parse source (writes to temp directory)
-        2. TreeBuilder moves to AGFS
-        3. (Optional) Build vector index
-        4. (Optional) Summarize
+        2. Check for duplicate source_path (deduplication)
+        3. TreeBuilder moves to AGFS
+        4. (Optional) Build vector index
+        5. (Optional) Summarize
         """
         result = {
             "status": "success",
@@ -176,39 +177,69 @@ class ResourceProcessor:
             # - temp_dir_path: Temporary directory path (Parser wrote all files)
             # - source_path, source_format
 
-            # ============ Phase 3: TreeBuilder finalizes from temp (scan + move to AGFS) ============
-            try:
-                finalize_start = time.perf_counter()
-                with get_viking_fs().bind_request_context(ctx):
-                    context_tree = await self.tree_builder.finalize_from_temp(
-                        temp_dir_path=parse_result.temp_dir_path,
-                        ctx=ctx,
-                        scope=scope,
-                        to_uri=to,
-                        parent_uri=parent,
-                        source_path=parse_result.source_path,
-                        source_format=parse_result.source_format,
-                    )
-                    if context_tree and context_tree.root:
-                        result["root_uri"] = context_tree.root.uri
-                        result["temp_uri"] = context_tree.root.temp_uri
-                telemetry.set(
-                    "resource.finalize.duration_ms",
-                    round((time.perf_counter() - finalize_start) * 1000, 3),
-                )
-            except Exception as e:
-                result["status"] = "error"
-                result["errors"].append(f"Finalize from temp error: {e}")
-                telemetry.set_error("resource_processor.finalize", "PROCESSING_ERROR", str(e))
-
-                # Cleanup temporary directory on error (via VikingFS)
+            # ============ Phase 2: Deduplication - check if source_path already exists ============
+            existing_uri = None
+            skip_dedup = kwargs.get("skip_dedup", False)
+            if not skip_dedup and not to and not parent:
+                # Only check for duplicates when:
+                # - Not explicitly skipped
+                # - No explicit target URI (to) specified
+                # - No explicit parent URI specified
                 try:
-                    if parse_result.temp_dir_path:
-                        await get_viking_fs().delete_temp(parse_result.temp_dir_path, ctx=ctx)
-                except Exception:
-                    pass
+                    existing_uri = await viking_fs.find_uri_by_source_path(
+                        source_path=result["source_path"],
+                        scope=scope,
+                        ctx=ctx,
+                    )
+                    if existing_uri:
+                        logger.info(
+                            f"[ResourceProcessor] Found existing resource for source_path={result['source_path']}: {existing_uri}"
+                        )
+                        result["root_uri"] = existing_uri
+                        result["is_update"] = True
+                        telemetry.set("resource.dedup.hit", True)
+                        telemetry.set("resource.dedup.existing_uri", existing_uri)
+                except Exception as e:
+                    logger.warning(
+                        f"[ResourceProcessor] Error checking for duplicate source_path: {e}"
+                    )
 
-                return result
+            # ============ Phase 3: TreeBuilder finalizes from temp (scan + move to AGFS) ============
+            # Skip finalization if we found an existing resource (will update instead)
+            context_tree = None
+            if not existing_uri:
+                try:
+                    finalize_start = time.perf_counter()
+                    with get_viking_fs().bind_request_context(ctx):
+                        context_tree = await self.tree_builder.finalize_from_temp(
+                            temp_dir_path=parse_result.temp_dir_path,
+                            ctx=ctx,
+                            scope=scope,
+                            to_uri=to,
+                            parent_uri=parent,
+                            source_path=parse_result.source_path,
+                            source_format=parse_result.source_format,
+                        )
+                        if context_tree and context_tree.root:
+                            result["root_uri"] = context_tree.root.uri
+                            result["temp_uri"] = context_tree.root.temp_uri
+                    telemetry.set(
+                        "resource.finalize.duration_ms",
+                        round((time.perf_counter() - finalize_start) * 1000, 3),
+                    )
+                except Exception as e:
+                    result["status"] = "error"
+                    result["errors"].append(f"Finalize from temp error: {e}")
+                    telemetry.set_error("resource_processor.finalize", "PROCESSING_ERROR", str(e))
+
+                    # Cleanup temporary directory on error (via VikingFS)
+                    try:
+                        if parse_result.temp_dir_path:
+                            await get_viking_fs().delete_temp(parse_result.temp_dir_path, ctx=ctx)
+                    except Exception:
+                        pass
+
+                    return result
 
             # ============ Phase 3.5: 首次添加立即落盘 + 生命周期锁 ============
             root_uri = result.get("root_uri")
@@ -252,12 +283,55 @@ class ResourceProcessor:
                         pass
 
                     result["temp_uri"] = root_uri
+
+                    # Write source path metadata for deduplication
+                    try:
+                        await viking_fs.write_source_meta(
+                            uri=root_uri,
+                            source_path=result["source_path"],
+                            source_format=parse_result.source_format,
+                            ctx=ctx,
+                        )
+                    except Exception as e:
+                        logger.warning(f"[ResourceProcessor] Failed to write source meta: {e}")
+
                 else:
                     # 增量更新：对目标目录加 SUBTREE 锁
                     resource_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
                     lifecycle_lock_handle_id = await self._try_acquire_lifecycle_lock(
                         lock_manager, resource_path
                     )
+
+                    # Write/update source path metadata for incremental update
+                    try:
+                        await viking_fs.write_source_meta(
+                            uri=root_uri,
+                            source_path=result["source_path"],
+                            source_format=parse_result.source_format,
+                            ctx=ctx,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[ResourceProcessor] Failed to write source meta for incremental update: {e}"
+                        )
+
+            elif existing_uri and root_uri:
+                # Existing resource found: clean up the temp directory since
+                # finalize_from_temp was skipped, then update source meta
+                try:
+                    if parse_result.temp_dir_path:
+                        await get_viking_fs().delete_temp(parse_result.temp_dir_path, ctx=ctx)
+                except Exception:
+                    pass
+                try:
+                    await viking_fs.write_source_meta(
+                        uri=root_uri,
+                        source_path=result["source_path"],
+                        source_format=parse_result.source_format,
+                        ctx=ctx,
+                    )
+                except Exception as e:
+                    logger.warning(f"[ResourceProcessor] Failed to update source meta: {e}")
 
             # ============ Phase 4: Optional Steps ============
             build_index = kwargs.get("build_index", True)

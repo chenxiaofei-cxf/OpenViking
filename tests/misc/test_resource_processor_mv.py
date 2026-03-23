@@ -20,6 +20,16 @@ class _DummyTelemetry:
     def set_error(self, *args, **kwargs):
         return None
 
+    def measure(self, *args, **kwargs):
+        class _CtxMgr:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        return _CtxMgr()
+
 
 class _CtxMgr:
     def __enter__(self):
@@ -48,6 +58,12 @@ class _FakeVikingFS:
     def _uri_to_path(self, uri, ctx=None):
         return f"/mock/{uri.replace('viking://', '')}"
 
+    async def find_uri_by_source_path(self, source_path, scope="resources", ctx=None):
+        return None
+
+    async def write_source_meta(self, uri, source_path, source_format=None, ctx=None):
+        return None
+
 
 @pytest.mark.asyncio
 async def test_resource_processor_first_add_persist_does_not_await_agfs_mv(monkeypatch):
@@ -60,6 +76,28 @@ async def test_resource_processor_first_add_persist_does_not_await_agfs_mv(monke
         lambda: _DummyTelemetry(),
     )
     monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: fake_fs)
+
+    # Mock the lock manager module
+    mock_lock_manager = MagicMock()
+    mock_lock_manager.create_handle = MagicMock(return_value=SimpleNamespace(id="handle-1"))
+    mock_lock_manager.acquire_subtree = AsyncMock(return_value=False)
+    mock_lock_manager.release = AsyncMock()
+    mock_lock_manager.get_handle = MagicMock(return_value=None)
+
+    class MockLockContext:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(
+        "openviking.storage.transaction.get_lock_manager", lambda: mock_lock_manager
+    )
+    monkeypatch.setattr("openviking.storage.transaction.LockContext", MockLockContext)
 
     rp = ResourceProcessor(vikingdb=_DummyVikingDB(), media_storage=None)
     rp._get_media_processor = MagicMock()

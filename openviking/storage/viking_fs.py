@@ -1857,3 +1857,128 @@ class VikingFS:
         except Exception as e:
             logger.error(f"[VikingFS] Failed to write {uri}: {e}")
             raise IOError(f"Failed to write {uri}: {e}")
+
+    # ========== Source Path Metadata (for deduplication) ==========
+
+    async def write_source_meta(
+        self,
+        uri: str,
+        source_path: str,
+        source_format: Optional[str] = None,
+        ctx: Optional[RequestContext] = None,
+    ) -> None:
+        """Write source path metadata to a resource directory.
+
+        This is used for deduplication: when the same source_path is added again,
+        we can find the existing resource and update it instead of creating a duplicate.
+
+        Args:
+            uri: Resource directory URI
+            source_path: Original source path (file/directory/URL)
+            source_format: Optional source format (e.g., 'repository', 'pdf')
+            ctx: Request context
+        """
+        self._ensure_access(uri, ctx)
+        meta = {
+            "source_path": source_path,
+            "source_format": source_format,
+            "updated_at": get_current_timestamp(),
+        }
+        meta_uri = f"{uri.rstrip('/')}/.source.json"
+        content = json.dumps(meta, ensure_ascii=False, indent=2)
+        await self.write_file(meta_uri, content, ctx=ctx)
+        logger.debug(f"[VikingFS] Wrote source meta: {uri} -> {source_path}")
+
+    async def read_source_meta(
+        self,
+        uri: str,
+        ctx: Optional[RequestContext] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Read source path metadata from a resource directory.
+
+        Args:
+            uri: Resource directory URI
+            ctx: Request context
+
+        Returns:
+            Dict with source_path, source_format, updated_at, or None if not found
+        """
+        self._ensure_access(uri, ctx)
+        meta_uri = f"{uri.rstrip('/')}/.source.json"
+        try:
+            content = await self.read_file(meta_uri, ctx=ctx)
+            return json.loads(content)
+        except Exception:
+            return None
+
+    async def find_uri_by_source_path(
+        self,
+        source_path: str,
+        scope: str = "resources",
+        ctx: Optional[RequestContext] = None,
+    ) -> Optional[str]:
+        """Find an existing resource URI by its source path.
+
+        This is used for deduplication: before adding a new resource,
+        check if a resource with the same source_path already exists.
+
+        Args:
+            source_path: Original source path to search for
+            scope: Scope to search in (default: 'resources')
+            ctx: Request context
+
+        Returns:
+            Existing resource URI if found, None otherwise
+        """
+        self._ensure_access(f"viking://{scope}", ctx)
+        base_uri = f"viking://{scope}"
+
+        # Normalize source_path for comparison
+        normalized_source = self._normalize_source_path(source_path)
+
+        # Search through resources to find matching source_path
+        try:
+            entries = await self.ls(base_uri, ctx=ctx)
+            for entry in entries:
+                if not entry.get("isDir"):
+                    continue
+                entry_uri = entry.get("uri", "")
+                if not entry_uri:
+                    continue
+                # Read source meta
+                meta = await self.read_source_meta(entry_uri, ctx=ctx)
+                if meta:
+                    existing_source = meta.get("source_path", "")
+                    if self._normalize_source_path(existing_source) == normalized_source:
+                        logger.info(
+                            f"[VikingFS] Found existing resource for source_path={source_path}: {entry_uri}"
+                        )
+                        return entry_uri
+        except Exception as e:
+            logger.warning(f"[VikingFS] Error searching for source_path={source_path}: {e}")
+
+        return None
+
+    @staticmethod
+    def _normalize_source_path(source_path: str) -> str:
+        """Normalize source path for comparison.
+
+        - Resolves relative paths to absolute
+        - Normalizes path separators
+        - Handles URLs by keeping them as-is
+        """
+        if not source_path:
+            return ""
+
+        # URLs: keep as-is (case-sensitive)
+        if source_path.startswith(("http://", "https://", "git@", "git://")):
+            return source_path.rstrip("/")
+
+        # Local paths: resolve to absolute and normalize
+        try:
+            from pathlib import Path
+
+            path = Path(source_path).resolve()
+            return str(path)
+        except Exception:
+            return source_path
